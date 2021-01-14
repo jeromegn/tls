@@ -1,6 +1,7 @@
 use super::*;
 use crate::common::IoSession;
 use rustls::Session;
+use std::os::unix::io::{AsRawFd, RawFd};
 
 /// A wrapper around an underlying raw stream which implements the TLS or SSL
 /// protocol.
@@ -122,5 +123,14 @@ where
         let mut stream =
             Stream::new(&mut this.io, &mut this.session).set_eof(!this.state.readable());
         stream.as_mut_pin().poll_shutdown(cx)
+    }
+}
+
+impl<IO> AsRawFd for TlsStream<IO>
+where
+    IO: AsRawFd,
+{
+    fn as_raw_fd(&self) -> RawFd {
+        self.get_ref().0.as_raw_fd()
     }
 }
