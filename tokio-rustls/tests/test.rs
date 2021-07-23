@@ -1,7 +1,7 @@
 use futures_util::future::TryFutureExt;
 use lazy_static::lazy_static;
-use rustls::internal::pemfile::{certs, rsa_private_keys};
-use rustls::{ClientConfig, ServerConfig};
+use rustls::{Certificate, ClientConfig, PrivateKey, RootCertStore, ServerConfig};
+use rustls_pemfile::{certs, rsa_private_keys};
 use std::io::{BufReader, Cursor};
 use std::net::SocketAddr;
 use std::sync::mpsc::channel;
@@ -18,13 +18,24 @@ const RSA: &str = include_str!("end.rsa");
 
 lazy_static! {
     static ref TEST_SERVER: (SocketAddr, &'static str, &'static str) = {
-        let cert = certs(&mut BufReader::new(Cursor::new(CERT))).unwrap();
-        let mut keys = rsa_private_keys(&mut BufReader::new(Cursor::new(RSA))).unwrap();
+        let cert = certs(&mut BufReader::new(Cursor::new(CERT)))
+            .map(|v| v.into_iter().map(|der| Certificate(der)).collect())
+            .unwrap();
+        let mut keys: Vec<PrivateKey> = rsa_private_keys(&mut BufReader::new(Cursor::new(RSA)))
+            .map(|v| v.into_iter().map(|der| PrivateKey(der)).collect())
+            .unwrap();
 
-        let mut config = ServerConfig::new(rustls::NoClientAuth::new());
-        config
-            .set_single_cert(cert, keys.pop().unwrap())
-            .expect("invalid key or certificate");
+        let config_builder = ServerConfig::builder()
+            .with_safe_default_cipher_suites()
+            .with_safe_default_kx_groups()
+            .with_safe_default_protocol_versions()
+            .unwrap();
+
+        let config = config_builder
+            .with_no_client_auth()
+            .with_single_cert(cert, keys.pop().unwrap())
+            .unwrap();
+
         let acceptor = TlsAcceptor::from(Arc::new(config));
 
         let (send, recv) = channel();
@@ -77,7 +88,6 @@ fn start_server() -> &'static (SocketAddr, &'static str, &'static str) {
 async fn start_client(addr: SocketAddr, domain: &str, config: Arc<ClientConfig>) -> io::Result<()> {
     const FILE: &'static [u8] = include_bytes!("../README.md");
 
-    let domain = webpki::DNSNameRef::try_from_ascii_str(domain).unwrap();
     let config = TlsConnector::from(config);
     let mut buf = vec![0; FILE.len()];
 
@@ -102,10 +112,21 @@ async fn pass() -> io::Result<()> {
     use std::time::*;
     tokio::time::sleep(Duration::from_secs(1)).await;
 
-    let mut config = ClientConfig::new();
-    let mut chain = BufReader::new(Cursor::new(chain));
-    config.root_store.add_pem_file(&mut chain).unwrap();
-    let config = Arc::new(config);
+    let config_builder = ClientConfig::builder()
+        .with_safe_default_cipher_suites()
+        .with_safe_default_kx_groups()
+        .with_safe_default_protocol_versions()
+        .unwrap();
+
+    let mut root_store = RootCertStore::empty();
+    let chain = certs(&mut BufReader::new(Cursor::new(chain))).unwrap();
+    root_store.add_parsable_certificates(&chain);
+
+    let config = Arc::new(
+        config_builder
+            .with_root_certificates(root_store, &[])
+            .with_no_client_auth(),
+    );
 
     start_client(addr.clone(), domain, config.clone()).await?;
 
@@ -116,10 +137,21 @@ async fn pass() -> io::Result<()> {
 async fn fail() -> io::Result<()> {
     let (addr, domain, chain) = start_server();
 
-    let mut config = ClientConfig::new();
-    let mut chain = BufReader::new(Cursor::new(chain));
-    config.root_store.add_pem_file(&mut chain).unwrap();
-    let config = Arc::new(config);
+    let config_builder = ClientConfig::builder()
+        .with_safe_default_cipher_suites()
+        .with_safe_default_kx_groups()
+        .with_safe_default_protocol_versions()
+        .unwrap();
+
+    let mut root_store = RootCertStore::empty();
+    let chain = certs(&mut BufReader::new(Cursor::new(chain))).unwrap();
+    root_store.add_parsable_certificates(&chain);
+
+    let config = Arc::new(
+        config_builder
+            .with_root_certificates(root_store, &[])
+            .with_no_client_auth(),
+    );
 
     assert_ne!(domain, &"google.com");
     let ret = start_client(addr.clone(), "google.com", config).await;

@@ -14,14 +14,14 @@ mod common;
 pub mod server;
 
 use common::{MidHandshake, Stream, TlsState};
-use rustls::{ClientConfig, ClientSession, ServerConfig, ServerSession, Session};
+use rustls::{ClientConfig, ClientConnection, Connection, ServerConfig, ServerConnection};
+use std::convert::TryInto;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use webpki::DNSNameRef;
 
 pub use rustls;
 pub use webpki;
@@ -68,20 +68,22 @@ impl TlsConnector {
     }
 
     #[inline]
-    pub fn connect<IO>(&self, domain: DNSNameRef, stream: IO) -> Connect<IO>
+    pub fn connect<IO>(&self, domain: &str, stream: IO) -> Connect<IO>
     where
         IO: AsyncRead + AsyncWrite + Unpin,
     {
         self.connect_with(domain, stream, |_| ())
     }
 
-    pub fn connect_with<IO, F>(&self, domain: DNSNameRef, stream: IO, f: F) -> Connect<IO>
+    pub fn connect_with<IO, F>(&self, domain: &str, stream: IO, f: F) -> Connect<IO>
     where
         IO: AsyncRead + AsyncWrite + Unpin,
-        F: FnOnce(&mut ClientSession),
+        F: FnOnce(&mut ClientConnection),
     {
-        let mut session = ClientSession::new(&self.inner, domain);
-        f(&mut session);
+        // TODO: no unwraps
+        let mut connection =
+            ClientConnection::new(Arc::clone(&self.inner), domain.try_into().unwrap()).unwrap();
+        f(&mut connection);
 
         Connect(MidHandshake::Handshaking(client::TlsStream {
             io: stream,
@@ -90,13 +92,13 @@ impl TlsConnector {
             state: TlsState::Stream,
 
             #[cfg(feature = "early-data")]
-            state: if self.early_data && session.early_data().is_some() {
+            state: if self.early_data && connection.early_data().is_some() {
                 TlsState::EarlyData(0, Vec::new())
             } else {
                 TlsState::Stream
             },
 
-            session,
+            connection,
         }))
     }
 }
@@ -113,13 +115,14 @@ impl TlsAcceptor {
     pub fn accept_with<IO, F>(&self, stream: IO, f: F) -> Accept<IO>
     where
         IO: AsyncRead + AsyncWrite + Unpin,
-        F: FnOnce(&mut ServerSession),
+        F: FnOnce(&mut ServerConnection),
     {
-        let mut session = ServerSession::new(&self.inner);
-        f(&mut session);
+        // TODO: no unwrap
+        let mut connection = ServerConnection::new(Arc::clone(&self.inner)).unwrap();
+        f(&mut connection);
 
         Accept(MidHandshake::Handshaking(server::TlsStream {
-            session,
+            connection,
             io: stream,
             state: TlsState::Stream,
         }))
@@ -201,7 +204,7 @@ pub enum TlsStream<T> {
 }
 
 impl<T> TlsStream<T> {
-    pub fn get_ref(&self) -> (&T, &dyn Session) {
+    pub fn get_ref(&self) -> (&T, &dyn Connection) {
         use TlsStream::*;
         match self {
             Client(io) => {
@@ -215,7 +218,7 @@ impl<T> TlsStream<T> {
         }
     }
 
-    pub fn get_mut(&mut self) -> (&mut T, &mut dyn Session) {
+    pub fn get_mut(&mut self) -> (&mut T, &mut dyn Connection) {
         use TlsStream::*;
         match self {
             Client(io) => {

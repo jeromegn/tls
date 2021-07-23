@@ -1,8 +1,12 @@
 use super::Stream;
 use futures_util::future::poll_fn;
 use futures_util::task::noop_waker_ref;
-use rustls::internal::pemfile::{certs, rsa_private_keys};
-use rustls::{ClientConfig, ClientSession, NoClientAuth, ServerConfig, ServerSession, Session};
+use rustls::{
+    Certificate, ClientConfig, ClientConnection, Connection, NoClientAuth, PrivateKey,
+    RootCertStore, ServerConfig, ServerConnection, ServerName,
+};
+use rustls_pemfile::{certs, rsa_private_keys};
+use std::convert::TryFrom;
 use std::io::{self, BufReader, Cursor, Read, Write};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -10,7 +14,7 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use webpki::DNSNameRef;
 
-struct Good<'a>(&'a mut dyn Session);
+struct Good<'a>(&'a mut dyn Connection);
 
 impl<'a> AsyncRead for Good<'a> {
     fn poll_read(
@@ -122,7 +126,9 @@ async fn stream_good() -> io::Result<()> {
 
     let (mut server, mut client) = make_pair();
     poll_fn(|cx| do_handshake(&mut client, &mut server, cx)).await?;
-    io::copy(&mut Cursor::new(FILE), &mut server)?;
+    println!("before copy");
+    io::copy(&mut Cursor::new(FILE), &mut server.writer())?;
+    println!("after copy");
 
     {
         let mut good = Good(&mut server);
@@ -130,13 +136,17 @@ async fn stream_good() -> io::Result<()> {
 
         let mut buf = Vec::new();
         stream.read_to_end(&mut buf).await?;
+        println!("after read_to_end");
         assert_eq!(buf, FILE);
         stream.write_all(b"Hello World!").await?;
+        println!("after write all");
         stream.flush().await?;
+        println!("after flush");
     }
 
     let mut buf = String::new();
-    server.read_to_string(&mut buf)?;
+    server.reader().read_to_string(&mut buf)?;
+    println!("after read_to_string");
     assert_eq!(buf, "Hello World!");
 
     Ok(()) as io::Result<()>
@@ -146,7 +156,7 @@ async fn stream_good() -> io::Result<()> {
 async fn stream_bad() -> io::Result<()> {
     let (mut server, mut client) = make_pair();
     poll_fn(|cx| do_handshake(&mut client, &mut server, cx)).await?;
-    client.set_buffer_limit(1024);
+    client.set_buffer_limit(Some(1024));
 
     let mut bad = Pending;
     let mut stream = Stream::new(&mut bad, &mut client);
@@ -221,39 +231,63 @@ async fn stream_eof() -> io::Result<()> {
     Ok(()) as io::Result<()>
 }
 
-fn make_pair() -> (ServerSession, ClientSession) {
+fn make_pair() -> (ServerConnection, ClientConnection) {
     const CERT: &str = include_str!("../../tests/end.cert");
     const CHAIN: &str = include_str!("../../tests/end.chain");
     const RSA: &str = include_str!("../../tests/end.rsa");
 
-    let cert = certs(&mut BufReader::new(Cursor::new(CERT))).unwrap();
-    let mut keys = rsa_private_keys(&mut BufReader::new(Cursor::new(RSA))).unwrap();
-    let mut sconfig = ServerConfig::new(NoClientAuth::new());
-    sconfig.set_single_cert(cert, keys.pop().unwrap()).unwrap();
-    let server = ServerSession::new(&Arc::new(sconfig));
+    let cert = certs(&mut BufReader::new(Cursor::new(CERT)))
+        .map(|v| v.into_iter().map(|der| Certificate(der)).collect())
+        .unwrap();
+    let mut keys: Vec<PrivateKey> = rsa_private_keys(&mut BufReader::new(Cursor::new(RSA)))
+        .map(|v| v.into_iter().map(|der| PrivateKey(der)).collect())
+        .unwrap();
+    let sconfig_builder = ServerConfig::builder()
+        .with_safe_default_cipher_suites()
+        .with_safe_default_kx_groups()
+        .with_safe_default_protocol_versions()
+        .unwrap();
+    let sconfig = sconfig_builder
+        .with_no_client_auth()
+        .with_single_cert(cert, keys.pop().unwrap())
+        .unwrap();
+    let server = ServerConnection::new(Arc::new(sconfig)).unwrap();
 
-    let domain = DNSNameRef::try_from_ascii_str("localhost").unwrap();
-    let mut cconfig = ClientConfig::new();
-    let mut chain = BufReader::new(Cursor::new(CHAIN));
-    cconfig.root_store.add_pem_file(&mut chain).unwrap();
-    let client = ClientSession::new(&Arc::new(cconfig), domain);
+    let cconfig_builder = ClientConfig::builder()
+        .with_safe_default_cipher_suites()
+        .with_safe_default_kx_groups()
+        .with_safe_default_protocol_versions()
+        .unwrap();
+
+    let mut root_store = RootCertStore::empty();
+    let chain = certs(&mut BufReader::new(Cursor::new(CHAIN))).unwrap();
+    root_store.add_parsable_certificates(&chain);
+
+    let cconfig = cconfig_builder
+        .with_root_certificates(root_store, &[])
+        .with_no_client_auth();
+    let client = ClientConnection::new(
+        Arc::new(cconfig),
+        ServerName::try_from("localhost").unwrap(),
+    )
+    .unwrap();
 
     (server, client)
 }
 
 fn do_handshake(
-    client: &mut ClientSession,
-    server: &mut ServerSession,
+    client: &mut ClientConnection,
+    server: &mut ServerConnection,
     cx: &mut Context<'_>,
 ) -> Poll<io::Result<()>> {
     let mut good = Good(server);
     let mut stream = Stream::new(&mut good, client);
 
-    while stream.session.is_handshaking() {
+    while stream.connection.is_handshaking() {
         ready!(stream.handshake(cx))?;
     }
 
-    while stream.session.wants_write() {
+    while stream.connection.wants_write() {
         ready!(stream.write_io(cx))?;
     }
 
